@@ -102,10 +102,11 @@ def create_application():
                                 debug=True)
 
 
-APP = create_application()
+# APP = create_application()
 
 
 def main():
+  APP = create_application()
   util.run_wsgi_app(APP)
 
 
