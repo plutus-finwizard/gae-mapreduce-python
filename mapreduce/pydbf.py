@@ -45,7 +45,7 @@ class DbfReader(object):
         self.format_size = struct.calcsize(self.format)
 
         if self.start_position != 0:
-            f.read((self.start_position)*self.format_size)
+            f.seek(self.header_len + (self.start_position*self.format_size), 0)
 
         self.iter = self.__iter__(f)
 
