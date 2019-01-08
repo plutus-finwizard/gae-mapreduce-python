@@ -21,6 +21,7 @@ __all__ = [
     "AbstractDatastoreInputReader",
     "ALLOW_CHECKPOINT",
     "BadReaderParamsError",
+    "BlobstoreDbfInputReader",
     "BlobstoreLineInputReader",
     "BlobstoreZipInputReader",
     "BlobstoreZipLineInputReader",
@@ -74,6 +75,7 @@ from mapreduce import operation
 from mapreduce import property_range
 from mapreduce import records
 from mapreduce import util
+from mapreduce import pydbf
 
 # pylint: disable=g-import-not-at-top
 # TODO(user): Cleanup imports if/when cloudstorage becomes part of runtime.
@@ -1282,6 +1284,149 @@ class _OldAbstractDatastoreInputReader(InputReader):
         current_key_range,
         filters=json.get(cls.FILTERS_PARAM))
 
+class BlobstoreDbfInputReader(InputReader):
+  """Input reader for a newline delimited blob in Blobstore."""
+
+  # Maximum number of shards to allow.
+  _MAX_SHARD_COUNT = 256
+
+  # Maximum number of blobs to allow.
+  _MAX_BLOB_KEYS_COUNT = 246
+
+  # Mapreduce parameters.
+  BLOB_KEYS_PARAM = "blob_keys"
+
+  # Serialization parmaeters.
+  INITIAL_POSITION_PARAM = "initial_position"
+  END_POSITION_PARAM = "end_position"
+  BLOB_KEY_PARAM = "blob_key"
+
+  def __init__(self, blob_key, start_position, end_position):
+    """Initializes this instance with the given blob key and character range.
+
+    This BlobstoreInputReader will read from the first record starting after
+    strictly after start_position until the first record ending at or after
+    end_position (exclusive). As an exception, if start_position is 0, then
+    this InputReader starts reading at the first record.
+
+    Args:
+      blob_key: the BlobKey that this input reader is processing.
+      start_position: the position to start reading at.
+      end_position: a position in the last record to read.
+    """
+    self._blob_key = blob_key
+    self._blob_reader = pydbf.DbfReader(blob_key, start_position)
+    self._end_position = end_position
+    self._has_iterated = False
+
+  def next(self):
+    """Returns the next input from as an (offset, line) tuple."""
+    self._has_iterated = True
+
+    line = self._blob_reader.readline()
+
+    start_position = self._blob_reader.tell()
+
+    if start_position > self._end_position:
+      raise StopIteration()
+
+    if not line:
+      raise StopIteration()
+
+    return start_position, line
+
+  def to_json(self):
+    """Returns an json-compatible input shard spec for remaining inputs."""
+    new_pos = self._blob_reader.tell()
+    if self._has_iterated:
+      new_pos -= 1
+    return {self.BLOB_KEY_PARAM: self._blob_key,
+            self.INITIAL_POSITION_PARAM: new_pos,
+            self.END_POSITION_PARAM: self._end_position}
+
+  def __str__(self):
+    """Returns the string representation of this BlobstoreDbfInputReader."""
+    return "blobstore.BlobKey(%r):[%d, %d]" % (
+        self._blob_key, self._blob_reader.tell(), self._end_position)
+
+  @classmethod
+  def from_json(cls, json):
+    """Instantiates an instance of this InputReader for the given shard spec."""
+    return cls(json[cls.BLOB_KEY_PARAM],
+               json[cls.INITIAL_POSITION_PARAM],
+               json[cls.END_POSITION_PARAM])
+
+  @classmethod
+  def validate(cls, mapper_spec):
+    """Validates mapper spec and all mapper parameters.
+
+    Args:
+      mapper_spec: The MapperSpec for this InputReader.
+
+    Raises:
+      BadReaderParamsError: required parameters are missing or invalid.
+    """
+    if mapper_spec.input_reader_class() != cls:
+      raise BadReaderParamsError("Mapper input reader class mismatch")
+    params = _get_params(mapper_spec)
+    if cls.BLOB_KEYS_PARAM not in params:
+      raise BadReaderParamsError("Must specify 'blob_keys' for mapper input")
+    blob_keys = params[cls.BLOB_KEYS_PARAM]
+    if isinstance(blob_keys, basestring):
+      # This is a mechanism to allow multiple blob keys (which do not contain
+      # commas) in a single string. It may go away.
+      blob_keys = blob_keys.split(",")
+    if len(blob_keys) > cls._MAX_BLOB_KEYS_COUNT:
+      raise BadReaderParamsError("Too many 'blob_keys' for mapper input")
+    if not blob_keys:
+      raise BadReaderParamsError("No 'blob_keys' specified for mapper input")
+    for blob_key in blob_keys:
+      blob_info = blobstore.BlobInfo.get(blobstore.BlobKey(blob_key))
+      if not blob_info:
+        raise BadReaderParamsError("Could not find blobinfo for key %s" %
+                                   blob_key)
+
+  @classmethod
+  def split_input(cls, mapper_spec):
+    """Returns a list of shard_count input_spec_shards for input_spec.
+
+    Args:
+      mapper_spec: The mapper specification to split from. Must contain
+          'blob_keys' parameter with one or more blob keys.
+
+    Returns:
+      A list of BlobstoreInputReaders corresponding to the specified shards.
+    """
+    params = _get_params(mapper_spec)
+    blob_keys = params[cls.BLOB_KEYS_PARAM]
+    if isinstance(blob_keys, basestring):
+      # This is a mechanism to allow multiple blob keys (which do not contain
+      # commas) in a single string. It may go away.
+      blob_keys = blob_keys.split(",")
+
+    blob_sizes = {}
+    for blob_key in blob_keys:
+      blob_info = pydbf.DbfInfo.get(blob_key)
+      blob_sizes[blob_key] = blob_info.size
+
+    shard_count = min(cls._MAX_SHARD_COUNT, mapper_spec.shard_count)
+    shards_per_blob = shard_count // len(blob_keys)
+    if shards_per_blob == 0:
+      shards_per_blob = 1
+
+    chunks = []
+    for blob_key, blob_size in blob_sizes.items():
+      blob_chunk_size = blob_size // shards_per_blob
+      for i in xrange(shards_per_blob - 1):
+        chunks.append(BlobstoreDbfInputReader.from_json(
+            {cls.BLOB_KEY_PARAM: blob_key,
+             cls.INITIAL_POSITION_PARAM: blob_chunk_size * i,
+             cls.END_POSITION_PARAM: blob_chunk_size * (i + 1)}))
+      chunks.append(BlobstoreDbfInputReader.from_json(
+          {cls.BLOB_KEY_PARAM: blob_key,
+           cls.INITIAL_POSITION_PARAM: blob_chunk_size * (shards_per_blob - 1),
+           cls.END_POSITION_PARAM: blob_size}))
+    return chunks
 
 class BlobstoreLineInputReader(InputReader):
   """Input reader for a newline delimited blob in Blobstore."""

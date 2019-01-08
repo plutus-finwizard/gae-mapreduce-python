@@ -622,14 +622,15 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
       self.slice_context.incr(context.COUNTER_MAPPER_CALLS)
 
       handler = transient_shard_state.handler
+      kwargs = transient_shard_state.mapreduce_spec.mapper.params.get('kwargs', {})
 
       if isinstance(handler, map_job.Mapper):
         handler(self.slice_context, data)
       else:
         if input_reader.expand_parameters:
-          result = handler(*data)
+          result = handler(*data, **kwargs)
         else:
-          result = handler(data)
+          result = handler(data, **kwargs)
 
         if util.is_generator(result):
           for output in result:
